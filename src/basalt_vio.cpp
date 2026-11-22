@@ -9,6 +9,7 @@
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace basalt_ros
@@ -148,7 +149,8 @@ void BasaltVio::imu_cb(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
 
 void BasaltVio::stereo_cb(const Image::ConstSharedPtr & left, const Image::ConstSharedPtr & right)
 {
-  const auto t_ns = to_ns(left->header.stamp);
+  // basalt vio does not apply the calibrated camera to imu time offset itself
+  const auto t_ns = to_ns(left->header.stamp) + calib_.cam_time_offset_ns;
   if (t_ns <= last_image_ns_) {
     return;
   }
@@ -336,7 +338,9 @@ void BasaltVio::publish_points(const basalt::VioVisualizationData & data)
 
 void BasaltVio::publish_depth(const basalt::VioVisualizationData & data)
 {
-  if (!data.opt_flow_res || !data.opt_flow_res->input_images || data.projections.empty()) {
+  if (!data.opt_flow_res || !data.opt_flow_res->input_images || data.projections.empty() ||
+    data.opt_flow_res->observations.empty())
+  {
     return;
   }
   const auto & left = data.opt_flow_res->input_images->img_data[0].img;
@@ -366,18 +370,34 @@ void BasaltVio::publish_depth(const basalt::VioVisualizationData & data)
     colored.data[3 * i + 2] = gray;
   }
 
-  // basalt gives [u, v, inverse distance, id], colours follow the openvins loop_depth scale
+  // projections are [u, v, inverse distance, keypoint id] in the current left image
+  std::unordered_map<size_t, double> inverse_distance;
+  for (const auto & proj : data.projections[0]) {
+    inverse_distance[static_cast<size_t>(proj[3])] = proj[2];
+  }
+
+  // like openvins: the tracked pixel position with the estimated depth, not a reprojection,
+  // so the squares stay put while the pose estimate moves by fractions of a pixel
   const int half = 4;
   auto * depth_mm = reinterpret_cast<uint16_t *>(depth.data.data());
-  for (const auto & proj : data.projections[0]) {
-    const int u = static_cast<int>(proj[0]);
-    const int v = static_cast<int>(proj[1]);
-    const double inverse_depth = proj[2];
-    if (u < half || u >= width - half || v < half || v >= height - half || inverse_depth <= 0.0) {
+  for (const auto & [id, transform] : data.opt_flow_res->observations[0]) {
+    const auto found = inverse_distance.find(id);
+    if (found == inverse_distance.end() || found->second <= 0.0) {
       continue;
     }
-    depth_mm[v * width + u] = static_cast<uint16_t>(std::min(65535.0, 1000.0 / inverse_depth));
+    Eigen::Vector4d ray;
+    if (!calib_.intrinsics[0].unproject(transform.translation().cast<double>(), ray)) {
+      continue;
+    }
+    const double z = ray.z() / ray.head<3>().norm() / found->second;
+    const int u = static_cast<int>(std::lround(transform.translation().x()));
+    const int v = static_cast<int>(std::lround(transform.translation().y()));
+    if (u < half || u >= width - half || v < half || v >= height - half || z <= 0.0) {
+      continue;
+    }
+    depth_mm[v * width + u] = static_cast<uint16_t>(std::min(65535.0, 1000.0 * z));
 
+    const double inverse_depth = 1.0 / z;
     const auto channel = [inverse_depth](double offset) {
       return static_cast<uint8_t>(255 - std::clamp(std::abs(offset - inverse_depth) * 255.0, 0.0, 255.0));
     };
